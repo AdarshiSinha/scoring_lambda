@@ -1,0 +1,155 @@
+# ── OpenSearch Infrastructure Pipeline ───────────────────────────────────────
+# One-time / on-demand pipeline for the shared OpenSearch cluster.
+# Jobs: deploy (dev + prd), recreate-index (dev + prd), destroy (dev).
+#
+# Triggered from the parent .gitlab-ci.yml via trigger:opensearch.
+# Can also be targeted directly via API:
+#   POST /projects/:id/pipeline
+#   { "ref": "main", "variables": [{ "key": "RUN_PIPELINE", "value": "opensearch" }] }
+
+include:
+  - project: 'vistaprint-org/internal-open-source/shared-templates/gitlab-ci'
+    ref: main
+    file: '/aws-oidc-auth/.aws-oidc-auth.yml'
+  - local: ci/templates/check-account.yml
+
+image: $AWS_RUNTIME
+
+default:
+  tags:
+    - ballista-francolin
+
+stages:
+  - deploy
+  - recreate-index
+  - cleanup
+
+# ── Reusable anchors ─────────────────────────────────────────────────────────
+
+.aws_auth: &aws_auth
+  before_script:
+    - !reference [.aws-oidc-auth, before_script]
+
+.install_dependencies: &install_dependencies
+  before_script:
+    - !reference [.aws-oidc-auth, before_script]
+    - install-nodejs
+    - npm install -g aws-cdk
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install -r lambda/index_creator/requirements.txt
+    - pip install -r lambda/index_creator/requirements.txt -t lambda/index_creator/
+
+# ── Base templates ────────────────────────────────────────────────────────────
+
+.deploy-opensearch:
+  stage: deploy
+  <<: *install_dependencies
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - echo "Deploying opensearch-infrastructure-${STAGE}..."
+    - cdk bootstrap aws://$AWS_ACCOUNT_ID/$AWS_DEFAULT_REGION --context stage=$STAGE || true
+    - cdk deploy opensearch-infrastructure-${STAGE} --context stage=$STAGE --require-approval never
+    - echo "✓ opensearch-infrastructure-${STAGE} deployed"
+  when: manual
+  allow_failure: false
+
+.destroy-opensearch:
+  stage: cleanup
+  <<: *install_dependencies
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - echo "WARNING — Destroying opensearch-infrastructure-${STAGE}..."
+    - cdk destroy opensearch-infrastructure-${STAGE} --context stage=$STAGE --force
+    - echo "✓ opensearch-infrastructure-${STAGE} destroyed"
+  when: manual
+  allow_failure: false
+
+.recreate-index:
+  stage: recreate-index
+  <<: *install_dependencies
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - echo "Recreating OpenSearch index for $STAGE environment..."
+    - |
+      aws lambda invoke \
+        --function-name opensearch-index-creator-$STAGE \
+        --cli-binary-format raw-in-base64-out \
+        --payload '{"RequestType":"Delete"}' \
+        --region $AWS_DEFAULT_REGION \
+        delete-response.json
+      echo "Delete response:"; cat delete-response.json
+    - echo "Waiting for index deletion to complete..."
+    - sleep 5
+    - |
+      aws lambda invoke \
+        --function-name opensearch-index-creator-$STAGE \
+        --cli-binary-format raw-in-base64-out \
+        --payload '{"RequestType":"Create"}' \
+        --region $AWS_DEFAULT_REGION \
+        create-response.json
+      echo "Create response:"; cat create-response.json
+    - echo "✓ Index recreated successfully for $STAGE"
+  when: manual
+  allow_failure: false
+
+# ── Concrete jobs ─────────────────────────────────────────────────────────────
+
+deploy:opensearch-dev:
+  extends: .deploy-opensearch
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+  rules:
+    - when: manual
+
+deploy:opensearch-prd:
+  extends: .deploy-opensearch
+  variables:
+    STAGE: prd
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+
+recreate-index:dev:
+  extends: .recreate-index
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+  rules:
+    - when: manual
+
+recreate-index:prd:
+  extends: .recreate-index
+  variables:
+    STAGE: prd
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+
+destroy:opensearch-dev:
+  extends: .destroy-opensearch
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+    action: stop
+  rules:
+    - when: manual
