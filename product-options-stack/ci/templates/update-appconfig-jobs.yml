@@ -1,0 +1,51 @@
+# ── Shared update-appconfig job definitions ───────────────────────────────────
+# Included by both fmx-data.gitlab-ci.yml and update-appconfig.gitlab-ci.yml.
+# Do not add stages: here — each including pipeline declares its own stages.
+#
+# Required pipeline variables:
+#   SUFFIX    — suffix of the already-deployed fmx-data-stores stack
+#   VERSION   — embedding model version, e.g. v9/20260505 (drives model_version in AppConfig)
+# Optional pipeline variables:
+#   POPULAR_OPTIONS_LIMIT — number of popular options to surface (default: 5)
+
+.update-appconfig-base:
+  stage: update-appconfig
+  before_script:
+    - !reference [.aws-oidc-auth, before_script]
+    - pip install --upgrade pip
+    - pip install -r scripts/requirements.txt
+    - pip install -r scripts/requirements-snowflake.txt --extra-index-url https://${DNA_ARTIFACTORY_CLIENT}:${DNA_ARTIFACTORY_SECRET}@vistaprint.jfrog.io/artifactory/api/pypi/pypi-local/simple
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - bash scripts/update_appconfig.sh
+  when: manual
+  allow_failure: false
+
+update-appconfig:dev:
+  extends: .update-appconfig-base
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+  rules:
+    - if: '$TARGET_ENV == "prd"'
+      when: never
+    - when: manual
+
+update-appconfig:prd:
+  extends: .update-appconfig-base
+  variables:
+    STAGE: prd
+  environment:
+    name: production
+  rules:
+    - if: '$TARGET_ENV == "dev"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+
+
