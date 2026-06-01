@@ -1,0 +1,4 @@
+snowflake-connector-python>=3.0.0
+# dpp is hosted on Vistaprint JFrog Artifactory.
+# Install via: pip install -r scripts/requirements-snowflake.txt --extra-index-url https://<user>:<pwd>@vistaprint.jfrog.io/artifactory/api/pypi/pypi-local/simple
+dpp
