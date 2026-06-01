@@ -1,0 +1,13 @@
+# ── Shared check-account job ──────────────────────────────────────────────────
+# Included by all child pipelines. Use !reference [.check_account, script]
+# to inject the account validation step into any job's script.
+
+.check_account:
+  script:
+    - |
+      ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+      if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+        echo "❌ ERROR: Account mismatch! Authenticated to $ACTUAL_ACCOUNT but expected $AWS_ACCOUNT_ID"
+        exit 1
+      fi
+      echo "✓ Authenticated to correct account: $AWS_ACCOUNT_ID"
