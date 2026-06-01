@@ -1,0 +1,26 @@
+# ── Update AppConfig Pipeline ──────────────────────────────────────────────────
+# Standalone pipeline: re-publishes AppConfig for an already-deployed
+# fmx-data-stores stack without re-deploying any infrastructure.
+#
+# Required variables:
+#   SUFFIX   — suffix of the ALREADY-DEPLOYED fmx-data-stores stack, e.g. 20260519
+#   VERSION  — embedding model version, e.g. v9/20260519 (drives model_version in AppConfig)
+# Optional variables:
+#   POPULAR_OPTIONS_LIMIT — number of popular options to surface (default: 5)
+
+include:
+  - project: 'vistaprint-org/internal-open-source/shared-templates/gitlab-ci'
+    ref: main
+    file: '/aws-oidc-auth/.aws-oidc-auth.yml'
+  - local: ci/templates/check-account.yml
+  - local: ci/templates/update-appconfig-jobs.yml
+
+image: $AWS_RUNTIME
+
+default:
+  tags:
+    - ballista-francolin
+
+stages:
+  - update-appconfig
+
