@@ -1,0 +1,251 @@
+# ── FMX Data Pipeline ─────────────────────────────────────────────────────────
+# Bi-weekly pipeline: deploy fmx-data-stores → wait for ingestion →
+#                     update AppConfig → destroy old stack.
+#
+# Triggered from the parent .gitlab-ci.yml via trigger:fmx-data.
+# Can also be targeted directly via API:
+#   POST /projects/:id/pipeline
+#   { "ref": "main", "variables": [
+#       { "key": "RUN_PIPELINE",         "value": "fmx-data" },
+#       { "key": "SUFFIX",               "value": "20260417" },
+#       { "key": "VERSION",              "value": "v9/20260417" }, # primary input — drives S3 paths AND model_version
+#       { "key": "CONFIG",               "value": "{...}" },       # optional full CDK override
+#       { "key": "DESTROY_STACK_SUFFIX", "value": "20260403" },    # optional
+#       { "key": "POPULAR_OPTIONS_LIMIT","value": "5" },           # optional (default: 5)
+#       { "key": "TARGET_ENV",           "value": "prd" }          # optional: "dev" or "prd" to run only one env
+#   ]}
+#
+# To run ONLY the update-appconfig step (re-publish AppConfig without re-deploying):
+#   POST /projects/:id/pipeline
+#   { "ref": "main", "variables": [
+#       { "key": "RUN_PIPELINE", "value": "update-appconfig" },
+#       { "key": "SUFFIX",       "value": "20260417" },
+#       { "key": "VERSION",      "value": "v9/20260417" }
+#   ]}
+#
+# Required variables (set via Run pipeline UI or API):
+#   SUFFIX    — suffix appended to fmx-data-stores stack name
+#   VERSION   — embedding model version in format v{N}/{YYYYMMDD}, e.g. v9/20260417
+#               Controls all S3 prefix paths AND the model_version in AppConfig ("fmX_v9").
+#               meta_split_calendars is sourced from Snowflake (DNA.PERSONALIZATION.CONF_META_SPLIT_CALENDAR).
+# Optional variables:
+#   CONFIG               — full CDK config JSON; overrides VERSION-derived defaults entirely
+#   DESTROY_STACK_SUFFIX — suffix of an old stack to destroy in cleanup stage
+#   POPULAR_OPTIONS_LIMIT — number of popular options to surface in AppConfig (default: 5)
+#   TARGET_ENV           — set to "dev" or "prd" to run only that environment's jobs (skips the other)
+
+include:
+  - project: 'vistaprint-org/internal-open-source/shared-templates/gitlab-ci'
+    ref: main
+    file: '/aws-oidc-auth/.aws-oidc-auth.yml'
+  - local: ci/templates/check-account.yml
+  - local: ci/templates/update-appconfig-jobs.yml
+
+image: $AWS_RUNTIME
+
+default:
+  tags:
+    - ballista-francolin
+
+cache:
+  paths:
+    - .cache/pip
+
+stages:
+  - deploy
+  - wait-for-ingestion
+  - update-appconfig
+  - cleanup
+
+# ── Reusable anchors ─────────────────────────────────────────────────────────
+
+.aws_auth: &aws_auth
+  before_script:
+    - !reference [.aws-oidc-auth, before_script]
+
+.install_dependencies: &install_dependencies
+  before_script:
+    - !reference [.aws-oidc-auth, before_script]
+    - install-nodejs
+    - npm install -g aws-cdk
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install -r lambda/index_creator/requirements.txt
+    - pip install -r lambda/index_creator/requirements.txt -t lambda/index_creator/
+
+.install_wait_dependencies: &install_wait_dependencies
+  before_script:
+    - !reference [.aws-oidc-auth, before_script]
+    - pip install --upgrade pip
+    - pip install -r scripts/requirements.txt
+
+# ── Base templates ────────────────────────────────────────────────────────────
+
+.deploy-fmx-data-stores:
+  stage: deploy
+  <<: *install_dependencies
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - |
+      MISSING=""
+      [[ -z "$SUFFIX" ]] && MISSING="$MISSING SUFFIX"
+      # VERSION is only required when CONFIG is not provided
+      [[ -z "$CONFIG" && -z "$VERSION" ]] && MISSING="$MISSING VERSION"
+      if [[ -n "$MISSING" ]]; then
+        echo "❌ ERROR: The following required variables are not set: $MISSING"
+        exit 1
+      fi
+    - STACK_NAME="fmx-data-stores-${STAGE}-${SUFFIX}"
+    - echo "Deploying $STACK_NAME to $STAGE (version=$VERSION)..."
+    - |
+      # If a full CONFIG override is supplied use it, otherwise let app.py derive paths from VERSION
+      # Guard against unexpanded GitLab variable references (e.g. literal '$CONFIG')
+      if [[ -n "$CONFIG" && "$CONFIG" != '$CONFIG' ]]; then
+        echo "ℹ️  Using full CONFIG override (VERSION ignored for path derivation)"
+        CDK_EXTRA="--context config=${CONFIG}"
+      else
+        CDK_EXTRA="--context version=${VERSION}"
+      fi
+    - cdk deploy $STACK_NAME --context stage=$STAGE --context suffix=$SUFFIX $CDK_EXTRA --require-approval never
+    - echo "✓ $STACK_NAME deployed"
+    - |
+      echo "DEPLOY_SUFFIX=${SUFFIX}" > deploy.env
+      echo "DEPLOY_VERSION=${VERSION}" >> deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+  when: manual
+  allow_failure: false
+
+.wait-fmx-data-stores:
+  stage: wait-for-ingestion
+  <<: *install_wait_dependencies
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - bash scripts/wait_for_ingestion.sh
+  when: on_success
+  allow_failure: false
+
+.destroy-fmx-data-stores:
+  stage: cleanup
+  <<: *aws_auth
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - !reference [.check_account, script]
+    - |
+      if [[ -z "$DESTROY_STACK_SUFFIX" ]]; then
+        echo "⚠️  DESTROY_STACK_SUFFIX is not set — skipping destroy."
+        exit 0
+      fi
+    - STACK_NAME="fmx-data-stores-${STAGE}-${DESTROY_STACK_SUFFIX}"
+    - echo "WARNING — Deleting $STACK_NAME..."
+    - |
+      aws cloudformation delete-stack \
+        --stack-name $STACK_NAME \
+        --region $AWS_DEFAULT_REGION
+      echo "Deletion submitted. Waiting for completion (up to 60 min)..."
+    - |
+      aws cloudformation wait stack-delete-complete \
+        --stack-name $STACK_NAME \
+        --region $AWS_DEFAULT_REGION
+      echo "✓ $STACK_NAME deleted"
+  when: manual
+  allow_failure: false
+
+# ── Concrete jobs ─────────────────────────────────────────────────────────────
+
+deploy:fmx-data-stores-dev:
+  extends: .deploy-fmx-data-stores
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+  rules:
+    - if: '$TARGET_ENV == "prd"'
+      when: never
+    - when: manual
+
+deploy:fmx-data-stores-prd:
+  extends: .deploy-fmx-data-stores
+  variables:
+    STAGE: prd
+  environment:
+    name: production
+  rules:
+    - if: '$TARGET_ENV == "dev"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+
+wait:fmx-data-stores-dev:
+  extends: .wait-fmx-data-stores
+  needs:
+    - job: deploy:fmx-data-stores-dev
+      artifacts: true
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+  rules:
+    - if: '$TARGET_ENV == "prd"'
+      when: never
+    - when: on_success
+
+wait:fmx-data-stores-prd:
+  extends: .wait-fmx-data-stores
+  needs:
+    - job: deploy:fmx-data-stores-prd
+      artifacts: true
+  variables:
+    STAGE: prd
+  environment:
+    name: production
+  rules:
+    - if: '$TARGET_ENV == "dev"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+
+destroy:fmx-data-stores-dev:
+  extends: .destroy-fmx-data-stores
+  needs:
+    - job: update-appconfig:dev
+      optional: false
+  variables:
+    STAGE: dev
+  environment:
+    name: development
+    action: stop
+  rules:
+    - if: '$TARGET_ENV == "prd"'
+      when: never
+    - when: manual
+
+destroy:fmx-data-stores-prd:
+  extends: .destroy-fmx-data-stores
+  needs:
+    - job: update-appconfig:prd
+      optional: false
+  variables:
+    STAGE: prd
+  environment:
+    name: production
+    action: stop
+  rules:
+    - if: '$TARGET_ENV == "dev"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+
